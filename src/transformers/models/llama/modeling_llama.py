@@ -294,7 +294,7 @@ class LlamaAttention(nn.Module):
                 f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
                 "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
                 "when creating this class."
-            )
+            ) # note the importance of layer_idx in cache access
 
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
@@ -353,7 +353,7 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: Optional[Cache] = None, # past KV is stored as a "cache" object
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
@@ -392,6 +392,8 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
+
+        # if cache exists
         if past_key_value is not None:
             if self.layer_idx is None:
                 raise ValueError(
@@ -399,17 +401,25 @@ class LlamaAttention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
+            # then the sequence length will include the ''usable length'' provided by this kv cache.
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models (ignore this for now)
+
+            # add to the Cache object the current key_states, value_states, layer_idx, and cache_kwargs (only relevant for RoPE).
+            # also return (presumably) the extended k-v state
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        # look into this soon
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        # note that this is done as a large block
+        # let us go through the math to see how this could be done partially quantized
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -741,6 +751,8 @@ class LlamaSdpaAttention(LlamaAttention):
         return attn_output, None, past_key_value
 
 
+# the method of cache access depends on class it seems
+# we start with eager
 LLAMA_ATTENTION_CLASSES = {
     "eager": LlamaAttention,
     "flash_attention_2": LlamaFlashAttention2,
@@ -815,6 +827,7 @@ class LlamaDecoderLayer(nn.Module):
         if output_attentions:
             outputs += (self_attn_weights,)
 
+        # appends the current K & V from self_attn block
         if use_cache:
             outputs += (present_key_value,)
 
@@ -1002,6 +1015,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         past_key_values_length = 0
         if use_cache:
+            # look for "Cache" object
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
